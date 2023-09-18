@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import re
 import subprocess
 import time
@@ -64,37 +65,39 @@ def get_cluster_arn(app: str, env: str) -> str:
     raise NoClusterConduitError
 
 
-def get_connection_secret_arn(app: str, env: str, name: str) -> str:
-    connection_secret_id = f"/copilot/{app}/{env}/secrets/{name}"
+@dataclass
+class ConnectionSecrets:
+    connection_secret: str
+    security_groups: str
 
-    secrets_manager = boto3.client("secretsmanager")
-    ssm = boto3.client("ssm")
 
+def get_connection_secrets(app: str, env: str, service_name: str) -> ConnectionSecrets:
     try:
-        return secrets_manager.describe_secret(SecretId=connection_secret_id)["ARN"]
-    except secrets_manager.exceptions.ResourceNotFoundException:
-        pass
+        command = subprocess.run(
+            args=["copilot", "task", "run", "--generate-cmd", f"{app}/{env}/{service_name}"],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        return ConnectionSecrets(
+            connection_secret=re.search(r"_SECRET=((\w|:|-)+)", command.stderr).group(1),
+            security_groups= re.search(r"security-groups (\S+)", command.stderr).group(1))
+    except subprocess.CalledProcessError as e:
+        print(e.stderr)
+        raise e
 
-    try:
-        return ssm.get_parameter(Name=connection_secret_id, WithDecryption=False)["Parameter"][
-            "ARN"
-        ]
-    except ssm.exceptions.ParameterNotFound:
-        pass
 
-    raise SecretNotFoundConduitError(name)
-
-
-def create_addon_client_task(app: str, env: str, addon_type: str, addon_name: str):
-    connection_secret_arn = get_connection_secret_arn(app, env, addon_name.upper())
+def create_addon_client_task(app: str, env: str, addon_type: str, addon_name: str, service_name: str):
+    connection_secrets = get_connection_secrets(app, env, service_name)
 
     subprocess.call(
         f"copilot task run --app {app} --env {env} "
         f"--task-group-name conduit-{app}-{env}-{normalise_string(addon_name)} "
         f"--image {CONDUIT_DOCKER_IMAGE_LOCATION}:{addon_type} "
-        f"--secrets CONNECTION_SECRET={connection_secret_arn} "
+        f"--secrets CONNECTION_SECRET={connection_secrets.connection_secret} "
         "--platform-os linux "
-        "--platform-arch arm64",
+        "--platform-arch arm64 "
+        f"--security-groups {connection_secrets.security_groups} ",
         shell=True,
     )
 
@@ -147,7 +150,7 @@ def connect_to_addon_client_task(app: str, env: str, cluster_arn: str, addon_nam
         raise CreateTaskTimeoutConduitError
 
 
-def start_conduit(app: str, env: str, addon_type: str, addon_name: str = None):
+def start_conduit(app: str, env: str, addon_type: str, service_name: str, addon_name: str = None):
     if addon_type not in CONDUIT_ADDON_TYPES:
         raise InvalidAddonTypeConduitError(addon_type)
 
@@ -155,7 +158,7 @@ def start_conduit(app: str, env: str, addon_type: str, addon_name: str = None):
     addon_name = addon_name or addon_type
 
     if not addon_client_is_running(app, env, cluster_arn, addon_name):
-        create_addon_client_task(app, env, addon_type, addon_name)
+        create_addon_client_task(app, env, addon_type, addon_name, service_name)
     connect_to_addon_client_task(app, env, cluster_arn, addon_name)
 
 
@@ -163,11 +166,11 @@ def start_conduit(app: str, env: str, addon_type: str, addon_name: str = None):
 @click.argument("addon_type")
 @click.option("--app", help="AWS application name", required=True)
 @click.option("--env", help="AWS environment name", required=True)
-@click.option("--addon-name", help="Name of custom addon", required=False)
-def conduit(addon_type: str, app: str, env: str, addon_name: str):
+@click.option("--service-name", help="Copilot Service name", required=True)
+def conduit(addon_type: str, app: str, env: str, service_name: str):
     """Create a conduit connection to a ADDON_TYPE backing service."""
     try:
-        start_conduit(app, env, addon_type, addon_name)
+        start_conduit(app, env, addon_type, service_name)
     except InvalidAddonTypeConduitError:
         click.secho(
             f"""Addon type "{addon_type}" does not exist, try one of {", ".join(CONDUIT_ADDON_TYPES)}.""",
@@ -176,12 +179,6 @@ def conduit(addon_type: str, app: str, env: str, addon_name: str):
         exit(1)
     except NoClusterConduitError:
         click.secho(f"""No ECS cluster found for "{app}" in "{env}" environment.""", fg="red")
-        exit(1)
-    except SecretNotFoundConduitError as err:
-        click.secho(
-            f"""No secret called "{addon_name or err}" for "{app}" in "{env}" environment.""",
-            fg="red",
-        )
         exit(1)
     except CreateTaskTimeoutConduitError:
         click.secho(
